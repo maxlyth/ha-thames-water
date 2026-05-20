@@ -123,6 +123,12 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
             config_entry=config_entry,
             update_interval=None,  # Updates are triggered manually at scheduled hours.
         )
+        # Cached across coordinator runs within the same HA process. Reset
+        # to None on HA restart (in-memory only — survives nothing). The
+        # ThamesWater client falls back to a full B2C re-auth if these are
+        # absent or rejected, so loss across restart is graceful.
+        self._cached_refresh_token: str | None = None
+        self._cached_cookies: dict | None = None
 
     async def _async_update_data(self) -> ThamesWaterData:
         """Fetch data, compute aggregates, and inject external statistics."""
@@ -186,6 +192,14 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
                 current_date = no_data_before
 
         # --- Authenticate ---
+        # The client constructor attempts the cached-refresh-token fast path
+        # first (cheap: one POST + one probe GET, ~1-2 s) and silently falls
+        # back to the full B2C OAuth flow (~10-20 s) if the cache is missing,
+        # rejected, or the session probe shows the cookies have expired. This
+        # avoids re-running the entire B2C signin chain on every scheduled
+        # fetch while still self-healing within the same coordinator call when
+        # the refresh token has expired — no waiting for the next scheduled
+        # run after a token expiry.
         config = self.config_entry.data
         try:
             _LOGGER.debug("Creating Thames Water client")
@@ -195,13 +209,32 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
                     config["username"],
                     config["password"],
                     config["account_number"],
+                    "cedfde2d-79a7-44fd-9833-cae769640d3d",  # client_id default
+                    self._cached_refresh_token,
+                    self._cached_cookies,
                 )
         except TimeoutError as err:
             raise UpdateFailed("Timeout creating Thames Water client") from err
         except asyncio.CancelledError:
             raise
         except Exception as err:
+            # Both paths (fast + fallback) have already been attempted inside
+            # the constructor. If we got here, both failed — clear the cache
+            # so the next run starts cleanly.
+            self._cached_refresh_token = None
+            self._cached_cookies = None
             raise UpdateFailed(f"Error creating Thames Water client: {err}") from err
+
+        # Harvest the latest refresh_token + cookies for next run's fast path.
+        # Done before the per-day fetch loop so that even a mid-loop failure
+        # leaves a usable cache. The fast path itself validates freshness
+        # before this code is reached.
+        self._cached_refresh_token = await self.hass.async_add_executor_job(
+            tw_client.get_latest_refresh_token
+        )
+        self._cached_cookies = await self.hass.async_add_executor_job(
+            tw_client.get_session_cookies
+        )
 
         # --- Fetch daily data ---
         readings: list[dict] = []

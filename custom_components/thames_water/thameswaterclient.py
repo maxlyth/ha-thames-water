@@ -56,12 +56,78 @@ class ThamesWater:
         password: str,
         account_number: int,
         client_id: str = "cedfde2d-79a7-44fd-9833-cae769640d3d",  # specific to Thames Water
+        cached_refresh_token: Optional[str] = None,
+        cached_cookies: Optional[dict] = None,
     ):
         self.s = requests.session()
         self.account_number = account_number
         self.client_id = client_id
 
+        if cached_refresh_token and cached_cookies:
+            try:
+                self._fast_path_refresh(cached_refresh_token, cached_cookies)
+                _LOGGER.info(
+                    "Reused cached refresh_token + session cookies for account %s",
+                    self.account_number,
+                )
+                return
+            except Exception as err:  # noqa: BLE001 — owner-requested fallback semantics
+                _LOGGER.info(
+                    "Cached refresh_token rejected for account %s (%s); "
+                    "falling back to full B2C authentication this run",
+                    self.account_number, err,
+                )
+                # Reset any partial state before the full re-auth attempt.
+                self.s = requests.session()
+
         self._authenticate(email, password)
+
+    def _fast_path_refresh(self, refresh_token: str, cookies: dict) -> None:
+        """Reuse a cached refresh_token + session cookies; raise on any failure.
+
+        The caller catches the exception and falls back to a full B2C
+        authentication within the same call. This satisfies the "no
+        waiting until the next scheduled run if the refresh token has
+        expired" requirement.
+        """
+        self.s.cookies.update(cookies)
+        # Seed `oauth_request_tokens` so the existing refresh helper can read it.
+        self.oauth_request_tokens = {"refresh_token": refresh_token}
+        self._refresh_oauth2_token_b2c_1_tw_website_signin()
+        # Probe the myaccount session: if the cookies have expired
+        # server-side, the AJAX endpoint will redirect to the sign-in
+        # page (200 + HTML) rather than returning JSON. Validate by
+        # hitting the meters-usage page and treating any non-2xx or
+        # missing-cookie outcome as a failure.
+        probe_headers = {
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+            "Referer": "https://myaccount.thameswater.co.uk/twservice/Account/SignIn?useremail=",
+        }
+        r = self.s.get(
+            f"https://myaccount.thameswater.co.uk/mydashboard/my-meters-usage?contractAccountNumber={self.account_number}",
+            headers=probe_headers, timeout=15, allow_redirects=False,
+        )
+        r.raise_for_status()
+        if r.status_code in (301, 302, 303, 307, 308):
+            raise RuntimeError(
+                f"myaccount session probe redirected ({r.status_code}); cached cookies appear expired"
+            )
+
+    def get_latest_refresh_token(self) -> Optional[str]:
+        """Return the most recent refresh_token, preferring the refreshed one."""
+        if hasattr(self, "oauth_response_tokens"):
+            tok = self.oauth_response_tokens.get("refresh_token")
+            if tok:
+                return tok
+        if hasattr(self, "oauth_request_tokens"):
+            tok = self.oauth_request_tokens.get("refresh_token")
+            if tok:
+                return tok
+        return None
+
+    def get_session_cookies(self) -> dict:
+        """Return current session cookies as a plain dict for caching."""
+        return dict(self.s.cookies)
 
     def _generate_pkce(self):
         self.pkce_verifier = (
@@ -184,7 +250,11 @@ class ThamesWater:
 
         headers = {"content-type": "application/x-www-form-urlencoded;charset=utf-8"}
 
-        r = self.s.get(url, headers=headers, data=data, timeout=30)
+        # OAuth 2.0 refresh_token grant is a POST (RFC 6749 §6) — the prior
+        # GET-with-body form would have been silently accepted by some servers
+        # but never actually refreshed the token. Required for the fast-path
+        # re-use of cached refresh_tokens.
+        r = self.s.post(url, headers=headers, data=data, timeout=30)
         r.raise_for_status()
         self.oauth_response_tokens = r.json()
 
