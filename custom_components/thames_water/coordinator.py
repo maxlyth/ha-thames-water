@@ -207,7 +207,6 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
         readings: list[dict] = []
         latest_reading = 0.0
         latest_day_data: DayData | None = None
-        pending_incomplete_days: list[tuple[datetime.datetime, list]] = []
 
         meter_id = config["meter_id"]
 
@@ -256,25 +255,19 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
             lines = data.Lines
 
             if len(lines) < 24:
+                # Skip incomplete days entirely. They will be re-fetched on
+                # the next coordinator run because last_stat_start_utc only
+                # advances on completed days, so partial days remain in the
+                # fetch range until they are complete. This avoids polluting
+                # statistics with partial-day data that can never be
+                # backfilled (the recorder cumulative sum cannot be retro-
+                # corrected for an earlier hour without rewriting all
+                # subsequent sums). Closes #21.
                 _LOGGER.warning(
-                    "Deferring %s/%s/%s — only %d/24 hours available",
+                    "Skipping %s/%s/%s — only %d/24 hours available; will retry on next coordinator run",
                     day, month, year, len(lines),
                 )
-                pending_incomplete_days.append((d, lines))
                 continue
-
-            # A complete day arrived — flush any previously deferred incomplete days.
-            if pending_incomplete_days:
-                for prev_day, prev_lines in pending_incomplete_days:
-                    _LOGGER.warning(
-                        "Assuming %s/%s/%s is broken (%d/24 hours) because %s/%s/%s is complete",
-                        prev_day.day, prev_day.month, prev_day.year,
-                        len(prev_lines), day, month, year,
-                    )
-                    prev_read, prev_data = _process_day_lines(prev_day, prev_lines, readings)
-                    latest_reading = prev_read
-                    latest_day_data = prev_data
-                pending_incomplete_days = []
 
             latest_reading, latest_day_data = _process_day_lines(d, lines, readings)
 
