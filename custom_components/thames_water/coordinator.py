@@ -354,8 +354,17 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
         if latest_reading == 0.0 and self.data is not None:
             latest_reading = self.data.latest_reading
 
+        # Symmetric preservation: if no day in this batch produced a complete
+        # DayData (e.g. the API only returned partial-day responses that this
+        # coordinator chose to skip) but stats were still injected from a
+        # tail of new hours, hold the previous latest_day rather than
+        # dropping the Daily Usage and Min Daily Flow sensors to "unknown".
+        # The early-return branch above already preserves latest_day on the
+        # no-readings path; this matches that behaviour on the readings-but-
+        # no-complete-day path.
+        prev = self.data
         return ThamesWaterData(
-            latest_day=latest_day_data,
+            latest_day=latest_day_data or (prev.latest_day if prev else None),
             latest_reading=latest_reading,
-            last_data_time=last_data_time,
+            last_data_time=last_data_time if latest_day_data else (prev.last_data_time if prev else last_data_time),
         )
