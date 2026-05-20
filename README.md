@@ -1,5 +1,11 @@
 # Thames Water Integration
 
+> **Fork note (1.3.2):** this fork carries three patches on top of upstream `ale770/ha-thames-water` v1.3.1, soak-tested locally before being proposed upstream. Track the contribution conversation at [ale770/ha-thames-water#29](https://github.com/ale770/ha-thames-water/issues/29). Switch back to upstream once these land there.
+>
+> - **Skip incomplete days** (closes upstream [#21](https://github.com/ale770/ha-thames-water/issues/21)) — days with fewer than 24 hourly readings are skipped entirely and re-fetched until complete, instead of being written as final partial data on the next complete day. The recorder cumulative sum stays honest.
+> - **Preserve last-known Daily Usage** — when a refresh produces no complete day, hold the previous `latest_day` value instead of dropping `sensor.thames_water_sensor` and `sensor.thames_water_meter_min_daily_flow` to `unknown`.
+> - **Reuse OAuth refresh_token** — cache the refresh_token + session cookies between coordinator runs and reuse them in a fast path (~1-2 s) instead of running the full B2C OAuth chain (~10-20 s) on every scheduled fetch. Falls back to a full re-auth inline when the cached token has expired so the fetch self-heals without waiting for the next scheduled slot. Also fixes a latent `GET`-with-body refresh-grant call to be a proper `POST` per RFC 6749 §6.
+
 [![hacs_badge](https://img.shields.io/badge/HACS-Default-orange.svg?style=for-the-badge)](https://github.com/custom-components/hacs)
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/V7V71CVL48)
